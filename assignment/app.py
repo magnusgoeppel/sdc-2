@@ -1,42 +1,78 @@
+"""Asynchronous image generation API built on FastAPI and Stable Diffusion."""
+
+import logging
 import os
-from fastapi import FastAPI, BackgroundTasks
+import uuid
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
 from image_generator import ImageGenerator
+from prompt_builder import build_prompt
 
-app = FastAPI()
+load_dotenv()
 
-# Function to be run as a background task.
-# This is just a placeholder function for demonstration.
-# In your application, this could be a function that generates an image.
-def write_log(message: str):
-    # Example of a time-consuming task: Writing a message to a file.
-    # Replace this with the logic of your image generation task.
-    with open("log.txt", "a") as file:
-        file.write(f"{message}\n")
+logger = logging.getLogger("uvicorn.error")
 
-@app.get("/example")
-async def example_endpoint(background_tasks: BackgroundTasks):
-    # This endpoint demonstrates how to add a background task.
-    # The `write_log` function will be executed after the response is sent.
-    # Note: The task runs in the same process but does not block the response.
-    background_tasks.add_task(write_log, "Example endpoint was visited")
-    return {"message": "This is an example endpoint"}
+IMAGE_DIR = Path("generated_images")
+IMAGE_DIR.mkdir(exist_ok=True)
 
-# TODO: Define your POST /images endpoint for asynchronous image generation
-# This endpoint should accept a custom prompt, process it asynchronously,
-# and return an image ID for later retrieval.
+app = FastAPI(title="Image Generation API")
+generator = ImageGenerator(os.environ["STABILITY_API_KEY"])
 
-# TODO: Implement the background task function for image generation
-# This function will use the ImageGenerator service to generate images
-# based on the provided custom prompt and save them.
+# In-memory job store: image_id -> {"status", "path", "prompt", "error"}.
+# Lost on restart, which is acceptable for this lab.
+JOBS: dict[str, dict] = {}
 
-# TODO: Create an endpoint for retrieving generated images
-# The endpoint should take an image ID and return the corresponding image
-# if it's ready, or an appropriate status message otherwise.
 
-# TODO: Implement error handling for various possible failure scenarios
+class ImageRequest(BaseModel):
+    prompt: str = Field(min_length=3, max_length=500)
+    style: str | None = None
 
-# OPTIONAL: Implement any necessary profanity checking or validation for the user prompts
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Plain def, NOT async def: generate_image() blocks for ~15 seconds, so FastAPI
+# must run this in its thread pool instead of on the event loop.
+def gen_image_task(image_id: str, prompt: str) -> None:
+    """Generate the image, save it to disk and update the job status."""
+    job = JOBS[image_id]
+    try:
+        png_bytes = generator.generate_image(prompt)
+        # The SDK returns None (without raising) when the safety filter triggers.
+        if png_bytes is None:
+            raise ValueError("no image returned, the prompt was probably blocked by the safety filter")
+        path = IMAGE_DIR / f"{image_id}.png"
+        path.write_bytes(png_bytes)
+        job.update(status="ready", path=path)
+    except Exception as exc:
+        # Without this, the error would vanish and the job would stay "processing" forever.
+        logger.exception("Image generation failed for %s", image_id)
+        job.update(status="failed", error=str(exc))
+
+
+@app.post("/images", status_code=202)
+async def create_image(request: ImageRequest, background_tasks: BackgroundTasks):
+    """Accept a request and generate the image in the background."""
+    image_id = str(uuid.uuid4())
+    final_prompt = build_prompt(request.prompt, request.style)
+    JOBS[image_id] = {"status": "processing", "path": None, "prompt": final_prompt, "error": None}
+    background_tasks.add_task(gen_image_task, image_id, final_prompt)
+    return {"image_id": image_id, "status": "processing", "prompt": final_prompt}
+
+
+@app.get("/image/{image_id}")
+async def get_image(image_id: str):
+    """Return the PNG if ready, otherwise the current job status."""
+    job = JOBS.get(image_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="image not found")
+    if job["status"] == "processing":
+        return JSONResponse(status_code=202, content={"image_id": image_id, "status": "processing"})
+    if job["status"] == "failed":
+        return JSONResponse(
+            status_code=500,
+            content={"image_id": image_id, "status": "failed", "error": job["error"]},
+        )
+    return Response(content=job["path"].read_bytes(), media_type="image/png")

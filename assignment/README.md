@@ -1,51 +1,51 @@
-### Project Description: Building a FastAPI Application with Stable Diffusion Image Generation
+# Image Generation API
 
-**Objective**: Develop a FastAPI application from scratch that integrates the Stable Diffusion model, provided by Stability AI for custom image generation. You will create an asynchronous API that accepts unique prompts, processes them using Stable Diffusion, and generates corresponding images.
+A FastAPI app that accepts an image request, answers immediately with an image ID, and generates the image in the background with Stable Diffusion. The image is fetched later by its ID.
 
-#### Background:
-- Stable Diffusion is a powerful AI model capable of creating detailed images from textual descriptions.
-- For now we'll simply integrate their sdk and access the model using their SaaS offering.
-- Your task is to understand how to effectively utilize a ml model in a FastAPI context.
+## Setup
 
-#### Resources Provided:
-- Access to the `ImageGenerator` API that uses Stable Diffusion.
-- A GPT-Service Implementation + API for optional profanity checking.
-- An API key for the `ImageGenerator` service.
-- Documentation on Stable Diffusion and its prompt-handling capabilities.
+```bash
+cd assignment
+uv sync
+uv run uvicorn app:app --port 8000
+```
 
-#### Key Tasks and Requirements:
-1. **Set Up a FastAPI Project**:
-   - Initialize a new FastAPI application.
-   - Install necessary dependencies, including libraries for interacting with the `ImageGenerator` service.
+The key is read from the `.env` file in the repository root: `STABILITY_API_KEY=<your-key>`. Docs: <http://localhost:8000/docs>
 
-2. **Custom Prompt Development**:
-   - Design a unique prompt structure that users can utilize your own image requirements.
+## API
 
-3. **Asynchronous Image Generation Endpoint (`/images`)**:
-   - Create an endpoint to accept image generation requests.
-   - Implement asynchronous processing using FastAPI's `BackgroundTasks`.
-   - Optional: use redis queue
+**`POST /images`**: `prompt` required (3–500 chars), `style` optional (`blueprint` (default), `storyboard`, `patent`).
 
-4. **Background Task for Image Generation (`gen_image_task`)**:
-   - Code a function that uses the `ImageGenerator` with custom prompts to generate images.
-   - Handle image saving and retrieval.
+```bash
+curl -X POST localhost:8000/images -H "Content-Type: application/json" \
+  -d '{"prompt": "a cat riding a bicycle", "style": "patent"}'
+```
 
-5. **Image Retrieval Endpoint (`/image/{image_id}`)**:
-   - Develop an endpoint for users to retrieve their generated images using an image ID.
-   - Implement appropriate responses for different image statuses (e.g., processing, ready, not found).
+Returns `202` immediately with `{"image_id": "...", "status": "processing", "prompt": "<final prompt>"}`, or `422` for an invalid body.
 
+**`GET /image/{image_id}`**
 
-#### Deliverables:
-- Complete source code of the FastAPI application.
-- A README or documentation detailing the API usage, setup instructions, and any important decisions made during development.
+```bash
+curl -o cat.png localhost:8000/image/<image_id>
+```
 
-#### Evaluation Criteria:
-- Functionality and correctness of the FastAPI application in an async way.
-- Effective integration of the Stable Diffusion model.
-- Creativity and utility of the custom prompt system.
+| State | Status | Body |
+|---|---|---|
+| ready | `200` | PNG bytes (`image/png`) |
+| processing | `202` | `{"image_id": "...", "status": "processing"}` |
+| failed | `500` | `{"image_id": "...", "status": "failed", "error": "..."}` |
+| unknown ID | `404` | `{"detail": "image not found"}` |
 
-#### Tips:
-- Start with a basic FastAPI setup and gradually integrate the image generation features.
+## Design decisions
 
+- **BackgroundTasks instead of a Redis queue:** a single process is enough for this app, so no extra infrastructure is needed.
+- **`gen_image_task` is a plain `def`:** the Stability SDK is synchronous and blocks for ~15 s. FastAPI runs plain `def` tasks in a thread pool; `async def` would block the event loop and the whole API. The task catches exceptions and the `None` the SDK returns when the safety filter triggers, so a job ends as `failed` instead of staying `processing` forever.
+- **In-memory job store:** a dict maps each ID to its status; images are saved in `generated_images/`. Simple, but lost on restart and limited to one process. In production this would be Redis or a database.
+- **Prompt system:** `prompt_builder.py` appends a style preset to the user's subject, so users only describe *what* they want. `ImageGenerator` stays unchanged and always adds a pencil-sketch style, so the three presets are chosen to fit that style: technical blueprint, storyboard panel and vintage patent drawing.
 
-This project is an excellent opportunity to demonstrate your skills in web API development, asynchronous programming, and AI model integration. Good luck!
+## Limitations
+
+- Job states are lost on restart.
+- Single worker only.
+- No authentication.
+- Prompts blocked by Stability's safety filter end as `failed`.
